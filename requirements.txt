@@ -1,0 +1,8 @@
+openai
+python-dotenv
+pyaudio
+sounddevice
+soundcard
+numpy
+customtkinter
+soundfile 
