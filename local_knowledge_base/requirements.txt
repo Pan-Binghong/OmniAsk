@@ -1,0 +1,15 @@
+langchain==0.1.0
+chromadb==0.4.22
+python-dotenv==1.0.0
+pypdf==3.17.1
+sentence-transformers==2.2.2
+torch>=2.0.0
+python-docx==0.8.11
+markdown==3.4.3
+beautifulsoup4==4.12.2
+faiss-cpu==1.7.4
+docx2txt==0.8
+unstructured==0.10.30 
+unstructured==0.10.30
+docx2txt==0.8 
+torch>=2.0.0 

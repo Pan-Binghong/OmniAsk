@@ -36,6 +36,7 @@ class AudioProcessor:
         self.audio_queue = queue.Queue()
         self.is_recording = False
         self.text_callback = None
+        self.volume_callback = None  # 添加音量回调函数
         
         # 从配置文件加载设置
         self.sample_rate = AUDIO_SETTINGS['sample_rate']
@@ -105,8 +106,16 @@ class AudioProcessor:
         self.is_recording = True
         
         def audio_callback(indata, frames, time, status):
+            """音频回调函数"""
             if status:
                 print(f"音频回调状态: {status}")
+            
+            # 计算当前音量级别，回调通知 UI
+            if np.any(indata):
+                volume_level = np.abs(indata).mean()
+                if self.volume_callback:
+                    self.volume_callback(volume_level)
+                
             self.audio_queue.put(indata.copy())
             
         def record_audio():
@@ -256,7 +265,20 @@ class AudioProcessor:
     def process_audio(self):
         """处理音频数据"""
         buffer_samples = int(self.sample_rate * self.buffer_duration)
-        silence_threshold = 0.001  # 静音阈值
+        silence_threshold = 0.002  # 提高静音阈值
+        min_speech_samples = int(self.sample_rate * 0.5)  # 最小语音片段时长（0.5秒）
+        max_speech_samples = int(self.sample_rate * 5.0)  # 最大语音片段时长（5秒）
+        speech_energy_threshold = 0.003  # 语音能量阈值
+        
+        # 语音状态
+        is_speech = False
+        speech_buffer = []
+        silence_counter = 0
+        max_silence_samples = int(self.sample_rate * 0.5)  # 最大静音时长（0.5秒）
+        
+        # 限制回复频率，避免重复提问
+        last_response_time = 0
+        min_response_interval = 2.0  # 最小回复间隔（秒）
         
         while self.is_recording:
             try:
@@ -267,31 +289,57 @@ class AudioProcessor:
                 if audio_data.shape[1] == 2:
                     audio_data = np.mean(audio_data, axis=1)
                 
-                self.latest_audio_data = audio_data
-                self.audio_buffer.extend(audio_data)
+                # 应用简单的噪声门限
+                audio_data = np.where(np.abs(audio_data) < silence_threshold, 0, audio_data)
                 
-                # 当缓冲区达到指定大小时处理音频
-                if len(self.audio_buffer) >= buffer_samples:
-                    audio_segment = np.array(self.audio_buffer[:buffer_samples])
-                    self.audio_buffer = self.audio_buffer[buffer_samples:]
-                    
-                    # 计算音量级别
-                    volume_level = np.abs(audio_segment).mean()
-                    
-                    # 只处理非静音的音频
-                    if volume_level > silence_threshold:
-                        # 标准化音频数据
-                        audio_segment = audio_segment / np.max(np.abs(audio_segment))
+                # 计算当前帧的能量
+                frame_energy = np.mean(np.abs(audio_data))
+                
+                if frame_energy > speech_energy_threshold:
+                    # 检测到语音
+                    if not is_speech:
+                        is_speech = True
+                        speech_buffer = []
+                    silence_counter = 0
+                    speech_buffer.extend(audio_data)
+                else:
+                    # 检测到静音
+                    if is_speech:
+                        silence_counter += len(audio_data)
+                        speech_buffer.extend(audio_data)
                         
-                        # 转写音频
-                        text = self.transcribe_audio(audio_segment)
-                        if text and self.text_callback:
-                            if self.is_question(text):
-                                answer = self.get_gpt_response(text)
-                                self.text_callback(f"问题: {text}\n回答: {answer}\n")
-                            else:
-                                self.text_callback(f"文本: {text}\n")
-                                
+                        # 如果静音时长超过阈值或语音长度超过最大值，处理当前语音片段
+                        if silence_counter >= max_silence_samples or len(speech_buffer) >= max_speech_samples:
+                            if len(speech_buffer) >= min_speech_samples:
+                                # 处理语音片段
+                                speech_segment = np.array(speech_buffer)
+                                # 标准化音频数据
+                                speech_segment = speech_segment / (np.max(np.abs(speech_segment)) + 1e-6)
+                                # 转写音频
+                                text = self.transcribe_audio(speech_segment)
+                                if text and self.text_callback:
+                                    text = text.strip()
+                                    if text and len(text) > 1:  # 只处理有意义的文本
+                                        current_time = time.time()
+                                        is_question_text = self.is_question(text)
+                                        
+                                        # 对于问题，检查是否需要响应
+                                        if is_question_text:
+                                            # 确保回复间隔大于最小间隔
+                                            if current_time - last_response_time >= min_response_interval:
+                                                self.text_callback(f"问题: {text}\n")
+                                                answer = self.get_gpt_response(text)
+                                                last_response_time = time.time()  # 更新最后响应时间
+                                            else:
+                                                # 响应太频繁，仅显示问题
+                                                self.text_callback(f"问题: {text} (等待中...)\n")
+                                        else:
+                                            self.text_callback(f"文本: {text}\n")
+                            # 重置状态
+                            is_speech = False
+                            speech_buffer = []
+                            silence_counter = 0
+                
             except queue.Empty:
                 # 队列超时，继续循环
                 continue
@@ -342,18 +390,52 @@ class AudioProcessor:
         
     def is_question(self, text):
         """检测文本是否为问题"""
-        return any(keyword in text for keyword in QUESTION_KEYWORDS)
+        # 添加更多的判断条件
+        
+        # 1. 如果直接包含问号，肯定是问题
+        if "?" in text or "？" in text:
+            return True
+            
+        # 2. 检查常见问句关键词
+        question_keywords = QUESTION_KEYWORDS + [
+            "请", "能否", "可以", "怎样", "多少", "几个", "是不是", 
+            "有没有", "为啥", "咋", "有何", "哪些", "啥时", "干嘛"
+        ]
+        
+        if any(keyword in text for keyword in question_keywords):
+            return True
+            
+        # 3. 检查特定的句式模式 (以"请"开头的指令)
+        if text.strip().startswith("请") and len(text) > 2:
+            return True
+            
+        # 4. 如果文本很长(超过15个字符)但没有任何问句特征，可能是陈述句
+        if len(text) > 15:
+            # 长文本但没有明显问句特征，可能是陈述或描述
+            return False
+            
+        # 5. 如果是较短的文本(<=15字符)且没有明显结束符，倾向于认为是问题
+        if len(text) <= 15 and not text.endswith(("。", "！", "~", "…")):
+            return True
+            
+        return False
         
     def get_gpt_response(self, question):
-        """获取GPT回答"""
+        """获取GPT回答，使用流式输出"""
         try:
+            # 先发送正在处理的提示
+            if self.text_callback:
+                self.text_callback("回答: ")
+                self.text_callback("<stream>🤔 正在思考...")
+            
             # 从GPT_SETTINGS中获取所有可用的参数
             completion_params = {
                 'model': GPT_SETTINGS['model'],
                 'messages': [
                     {"role": "system", "content": GPT_SETTINGS['system_prompt']},
                     {"role": "user", "content": question}
-                ]
+                ],
+                'stream': True  # 启用流式输出
             }
             
             # 可选参数，如果在设置中存在则添加
@@ -362,10 +444,48 @@ class AudioProcessor:
             for param in optional_params:
                 if param in GPT_SETTINGS:
                     completion_params[param] = GPT_SETTINGS[param]
-
-            # 调用API
+            
+            # 用于累积完整的回答
+            full_response = ""
+            
+            # 清除"正在思考"提示
+            if self.text_callback:
+                self.text_callback("<stream>\r" + " " * 20 + "\r")  # 清除当前行
+                time.sleep(0.1)  # 短暂停顿
+            
+            # 使用流式调用API
             response = self.client.chat.completions.create(**completion_params)
-            return response.choices[0].message.content
+            
+            # 逐个处理流式响应的内容
+            for chunk in response:
+                # 安全地检查是否有内容，避免索引错误
+                try:
+                    if hasattr(chunk, 'choices') and chunk.choices and hasattr(chunk.choices[0], 'delta'):
+                        delta = chunk.choices[0].delta
+                        if hasattr(delta, 'content') and delta.content:
+                            content = delta.content
+                            full_response += content
+                            # 发送带有特殊标记的增量更新
+                            if self.text_callback:
+                                self.text_callback(f"<stream>{content}")
+                            # 小延迟，避免过快刷新
+                            time.sleep(0.01)
+                except (IndexError, AttributeError) as e:
+                    print(f"处理流式响应块时出错: {e}")
+                    continue  # 跳过这个块，继续处理下一个
+            
+            return full_response
+            
         except Exception as e:
+            error_message = f"抱歉，获取答案时出现错误: {str(e)}"
             print(f"GPT API 错误: {e}")
-            return "抱歉，获取答案时出现错误。" 
+            
+            if self.text_callback:
+                # 清除现有内容
+                self.text_callback("<stream>\r" + " " * 50 + "\r")  # 清除当前行
+                time.sleep(0.1)  # 短暂停顿
+                
+                # 显示错误消息
+                self.text_callback(f"<stream>❌ {error_message}")
+                
+            return error_message 
