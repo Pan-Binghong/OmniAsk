@@ -14,12 +14,13 @@ import wave
 import requests
 import json
 import mimetypes
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Callable, Any
 from openai import OpenAI
 import psutil
 import win32gui
 import win32process
 from ..config.settings import AUDIO_SETTINGS, WHISPER_SETTINGS, GPT_SETTINGS, QUESTION_KEYWORDS
+from ..utils.error_handler import ErrorHandler
 
 # 用于multipart/form-data请求的boundary
 BOUNDARY = '----WebKitFormBoundary' + ''.join(['1234567890', 'abcdefghijklmnopqrstuvwxyz'][:10])
@@ -29,27 +30,43 @@ QUESTION_KEYWORDS = ['吗', '?', '？', '什么', '为什么', '如何', '怎么
 
 class AudioProcessor:
     def __init__(self):
-        self.client = OpenAI(
-            api_key=os.getenv('OPENAI_API_KEY'),
-            base_url=os.getenv('OPENAI_BASE_URL')
-        )
+        """初始化音频处理器"""
+        # 初始化API客户端
+        try:
+            self.client = OpenAI(
+                api_key=os.getenv('OPENAI_API_KEY'),
+                base_url=os.getenv('OPENAI_BASE_URL')
+            )
+        except Exception as e:
+            ErrorHandler.handle_error(e, "API客户端初始化失败")
+            raise
+            
+        # 初始化内部状态
         self.audio_queue = queue.Queue()
         self.is_recording = False
         self.text_callback = None
-        self.volume_callback = None  # 添加音量回调函数
+        self.volume_callback = None
         
         # 从配置文件加载设置
-        self.sample_rate = AUDIO_SETTINGS['sample_rate']
-        self.channels = AUDIO_SETTINGS['channels']
-        self.chunk_duration = AUDIO_SETTINGS['chunk_duration']
-        self.buffer_duration = AUDIO_SETTINGS['buffer_duration']
+        self.sample_rate = AUDIO_SETTINGS['SAMPLE_RATE']
+        self.channels = AUDIO_SETTINGS['CHANNELS']
+        self.chunk_duration = AUDIO_SETTINGS.get('CHUNK_DURATION', 0.1)
+        self.buffer_duration = AUDIO_SETTINGS['BUFFER_DURATION']
         
         self.audio_buffer = []
         self.latest_audio_data = np.array([])
         self.current_device = None
         
-    def get_audio_devices(self):
+    def get_audio_devices(self) -> List[tuple]:
         """获取所有音频设备"""
+        return ErrorHandler.safe_execute(
+            self._get_audio_devices,
+            "获取音频设备时出错",
+            default_return=[]
+        )
+    
+    def _get_audio_devices(self) -> List[tuple]:
+        """内部方法：获取所有音频设备"""
         devices = sd.query_devices()
         device_list = []
         
@@ -77,8 +94,16 @@ class AudioProcessor:
                 
         return device_list
         
-    def get_audio_applications(self):
+    def get_audio_applications(self) -> List[tuple]:
         """获取正在播放音频的应用程序"""
+        return ErrorHandler.safe_execute(
+            self._get_audio_applications,
+            "获取音频应用程序时出错",
+            default_return=[]
+        )
+    
+    def _get_audio_applications(self) -> List[tuple]:
+        """内部方法：获取正在播放音频的应用程序"""
         apps = []
         def enum_windows_callback(hwnd, results):
             if win32gui.IsWindowVisible(hwnd):
@@ -94,86 +119,114 @@ class AudioProcessor:
         win32gui.EnumWindows(enum_windows_callback, [])
         return list(set(apps))
         
-    def get_available_devices(self):
+    def get_available_devices(self) -> List[tuple]:
         """获取所有可用的音频设备和应用程序"""
         devices = self.get_audio_devices()
         for pid, app_name in self.get_audio_applications():
             devices.append(("app", pid, app_name))
         return devices
         
-    def start_recording(self, device_type, device_id):
+    def audio_callback(self, indata, frames, time, status):
+        """音频回调函数，处理捕获的音频数据"""
+        if status:
+            print(f"音频回调状态: {status}")
+        
+        # 计算当前音量级别
+        if np.any(indata):
+            volume_level = np.abs(indata).mean()
+            if self.volume_callback:
+                self.volume_callback(volume_level)
+        
+        self.audio_queue.put(indata.copy())
+        
+    def start_recording(self, device_type: str, device_id: int):
         """开始录音"""
+        if self.is_recording:
+            # 如果已经在录音，先停止当前录音
+            self.stop_recording()
+            
         self.is_recording = True
         
-        def audio_callback(indata, frames, time, status):
-            """音频回调函数"""
-            if status:
-                print(f"音频回调状态: {status}")
+        # 启动录音线程
+        self.record_thread = threading.Thread(
+            target=lambda: ErrorHandler.safe_execute(
+                self._record_audio,
+                "录音过程中出错",
+                self.text_callback,
+                device_type=device_type,
+                device_id=device_id
+            )
+        )
+        
+        # 启动处理线程
+        self.process_thread = threading.Thread(
+            target=lambda: ErrorHandler.safe_execute(
+                self.process_audio,
+                "处理音频时出错",
+                self.text_callback
+            )
+        )
+        
+        self.record_thread.start()
+        self.process_thread.start()
             
-            # 计算当前音量级别，回调通知 UI
-            if np.any(indata):
-                volume_level = np.abs(indata).mean()
-                if self.volume_callback:
-                    self.volume_callback(volume_level)
-                
-            self.audio_queue.put(indata.copy())
+    def _record_audio(self, device_type: str, device_id: int):
+        """内部方法：实际录音实现"""
+        try:
+            # 获取设备信息
+            devices = sd.query_devices()
+            device_info = None
+            selected_device_id = device_id  # 保存原始device_id
             
-        def record_audio():
-            try:
-                # 获取设备信息
-                devices = sd.query_devices()
-                device_info = None
-                selected_device_id = device_id  # 保存原始device_id
+            if device_type == "app":
+                # 查找VB-CABLE Output设备
+                for i, dev in enumerate(devices):
+                    if dev['max_input_channels'] > 0 and ('CABLE Output' in dev['name'] or 'VB-Audio' in dev['name']):
+                        selected_device_id = i
+                        device_info = dev
+                        break
                 
-                if device_type == "app":
-                    # 查找VB-CABLE Output设备
-                    for i, dev in enumerate(devices):
-                        if dev['max_input_channels'] > 0 and ('CABLE Output' in dev['name'] or 'VB-Audio' in dev['name']):
-                            selected_device_id = i
-                            device_info = dev
-                            break
-                    
-                    # 如果没找到VB-CABLE，尝试使用默认输入设备
-                    if device_info is None:
-                        default_device = sd.query_devices(kind='input')
-                        selected_device_id = default_device['index']
-                        device_info = default_device
-                else:
-                    device_info = devices[selected_device_id]
-                
+                # 如果没找到VB-CABLE，尝试使用默认输入设备
                 if device_info is None:
-                    raise Exception("找不到可用的音频设备")
-                
-                # 保存当前设备信息
-                self.current_device = device_info
-                
-                # 设置采样率和通道数
-                self.sample_rate = int(device_info['default_samplerate'])
-                self.channels = min(2, device_info['max_input_channels'])
-                
-                # 配置音频流
-                stream_config = {
-                    'device': selected_device_id,
-                    'channels': self.channels,
-                    'samplerate': self.sample_rate,
-                    'callback': audio_callback,
-                    'blocksize': int(self.sample_rate * self.chunk_duration)
-                }
-                
-                # 使用WASAPI共享模式
-                if device_type in ["output", "app"]:
-                    stream_config['extra_settings'] = dict(
-                        wasapi_shared=True,
-                        wasapi_exclusive=False
-                    )
-                
-                # 创建音频流
-                with sd.InputStream(**stream_config):
-                    if self.text_callback:
-                        self.text_callback(f"正在使用设备: {device_info['name']}\n")
-                        self.text_callback(f"采样率: {self.sample_rate}Hz, 通道数: {self.channels}\n")
-                        if device_type == "app":
-                            self.text_callback("""
+                    default_device = sd.query_devices(kind='input')
+                    selected_device_id = default_device['index']
+                    device_info = default_device
+            else:
+                device_info = devices[selected_device_id]
+            
+            if device_info is None:
+                raise Exception("找不到可用的音频设备")
+            
+            # 保存当前设备信息
+            self.current_device = device_info
+            
+            # 设置采样率和通道数
+            self.sample_rate = int(device_info['default_samplerate'])
+            self.channels = min(2, device_info['max_input_channels'])
+            
+            # 配置音频流
+            stream_config = {
+                'device': selected_device_id,
+                'channels': self.channels,
+                'samplerate': self.sample_rate,
+                'callback': self.audio_callback,
+                'blocksize': int(self.sample_rate * self.chunk_duration)
+            }
+            
+            # 使用WASAPI共享模式
+            if device_type in ["output", "app"]:
+                stream_config['extra_settings'] = dict(
+                    wasapi_shared=True,
+                    wasapi_exclusive=False
+                )
+            
+            # 创建音频流
+            with sd.InputStream(**stream_config):
+                if self.text_callback:
+                    self.text_callback(f"正在使用设备: {device_info['name']}\n")
+                    self.text_callback(f"采样率: {self.sample_rate}Hz, 通道数: {self.channels}\n")
+                    if device_type == "app":
+                        self.text_callback("""
 请确保：
 1. VB-CABLE已正确安装并启用：
    - 在Windows声音设置中找到"CABLE Output"
@@ -196,14 +249,18 @@ class AudioProcessor:
    - 检查是否有其他程序占用音频设备
    - 尝试重新插拔耳机或重启电脑
 \n""")
+                
+                while self.is_recording:
+                    sd.sleep(int(1000 * self.chunk_duration))
                     
-                    while self.is_recording:
-                        sd.sleep(int(1000 * self.chunk_duration))
-                        
-            except Exception as e:
-                error_msg = f"录音错误: {str(e)}\n"
-                if device_type == "app":
-                    error_msg += f"""
+        except Exception as e:
+            if not self.is_recording:
+                # 如果已经不在录音状态，说明是正常停止，不需要报错
+                return
+                
+            error_msg = f"录音错误: {str(e)}\n"
+            if device_type == "app":
+                error_msg += f"""
 音频设备配置错误，请检查：
 1. 设备状态：
    - 当前设备: {self.current_device['name'] if self.current_device else '未知'}
@@ -219,16 +276,9 @@ class AudioProcessor:
 3. 详细错误信息：
 {str(e)}
 """
-                print(error_msg)
-                if self.text_callback:
-                    self.text_callback(error_msg)
-                self.is_recording = False
-                
-        self.record_thread = threading.Thread(target=record_audio)
-        self.process_thread = threading.Thread(target=self.process_audio)
-        
-        self.record_thread.start()
-        self.process_thread.start()
+            if self.text_callback:
+                self.text_callback(error_msg)
+            self.is_recording = False
         
     def stop_recording(self):
         """停止录音"""
@@ -258,27 +308,31 @@ class AudioProcessor:
             self.current_device = None
             
         except Exception as e:
-            print(f"停止录音时出错: {e}")
+            ErrorHandler.handle_error(e, "停止录音时出错", self.text_callback)
         finally:
             print("录音已停止")
             
     def process_audio(self):
         """处理音频数据"""
         buffer_samples = int(self.sample_rate * self.buffer_duration)
-        silence_threshold = 0.002  # 提高静音阈值
-        min_speech_samples = int(self.sample_rate * 0.5)  # 最小语音片段时长（0.5秒）
-        max_speech_samples = int(self.sample_rate * 5.0)  # 最大语音片段时长（5秒）
-        speech_energy_threshold = 0.003  # 语音能量阈值
+        
+        # 从配置文件读取参数
+        silence_threshold = AUDIO_SETTINGS.get("SILENCE_THRESHOLD", 0.0015)  # 静音阈值，增加灵敏度
+        min_speech_samples = int(self.sample_rate * AUDIO_SETTINGS.get("MIN_SPEECH_DURATION", 0.5))  # 最小语音片段时长
+        max_speech_samples = int(self.sample_rate * AUDIO_SETTINGS.get("MAX_RECORDING_DURATION", 20.0))  # 最大语音片段时长（最多20秒）
+        speech_energy_threshold = AUDIO_SETTINGS.get("SPEECH_ENERGY_THRESHOLD", 0.002)  # 语音能量阈值
         
         # 语音状态
         is_speech = False
         speech_buffer = []
         silence_counter = 0
-        max_silence_samples = int(self.sample_rate * 0.5)  # 最大静音时长（0.5秒）
+        # 从配置文件读取最大静音时长，默认为1.5秒
+        max_silence_samples = int(self.sample_rate * AUDIO_SETTINGS.get("PAUSE_TOLERANCE", 1.5))
         
         # 限制回复频率，避免重复提问
         last_response_time = 0
-        min_response_interval = 2.0  # 最小回复间隔（秒）
+        # 从配置文件读取最小回复间隔，默认为2.0秒
+        min_response_interval = AUDIO_SETTINGS.get("SPEECH_TIMEOUT", 2.0)
         
         while self.is_recording:
             try:
@@ -344,51 +398,43 @@ class AudioProcessor:
                 # 队列超时，继续循环
                 continue
             except Exception as e:
-                print(f"处理错误: {e}")
-                if self.text_callback:
-                    self.text_callback(f"错误: {str(e)}\n")
-                # 不要因为处理错误就退出循环
+                ErrorHandler.handle_error(e, "处理音频数据时出错", self.text_callback)
                     
-    def transcribe_audio(self, audio_data):
-        """
-        使用 OpenAI Whisper API 将音频转写为文本
-        
-        Args:
-            audio_data: 音频数据
-            
-        Returns:
-            str: 转写的文本，如果失败则返回 None
-        """
+    def transcribe_audio(self, audio_data: np.ndarray) -> Optional[str]:
+        """使用OpenAI Whisper API转写音频"""
+        return ErrorHandler.safe_execute(
+            self._transcribe_audio,
+            "转写音频时出错",
+            self.text_callback,
+            audio_data=audio_data
+        )
+    
+    def _transcribe_audio(self, audio_data: np.ndarray) -> Optional[str]:
+        """内部方法：实际转写实现"""
+        # 将音频数据保存为临时文件
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            sf.write(temp_file.name, audio_data, self.sample_rate)
+            temp_filename = temp_file.name
+
         try:
-            # 将音频数据保存为临时文件
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                sf.write(temp_file.name, audio_data, self.sample_rate)
-                temp_filename = temp_file.name
-
+            # 使用OpenAI客户端进行音频转写
+            with open(temp_filename, 'rb') as audio_file:
+                transcript = self.client.audio.transcriptions.create(
+                    model=WHISPER_SETTINGS['model'],
+                    file=audio_file,
+                    language=WHISPER_SETTINGS.get('language', 'zh'),
+                    prompt=WHISPER_SETTINGS.get('prompt', None),
+                    response_format="json"
+                )
+                return transcript.text.strip()
+        finally:
+            # 确保临时文件被删除
             try:
-                # 使用OpenAI客户端进行音频转写
-                with open(temp_filename, 'rb') as audio_file:
-                    transcript = self.client.audio.transcriptions.create(
-                        model=WHISPER_SETTINGS['model'],
-                        file=audio_file,
-                        language=WHISPER_SETTINGS.get('language', 'zh'),
-                        prompt=WHISPER_SETTINGS.get('prompt', None),
-                        response_format="json"
-                    )
-                    return transcript.text.strip()
-
-            finally:
-                # 确保临时文件被删除
-                try:
-                    os.unlink(temp_filename)
-                except Exception as e:
-                    print(f"删除临时文件时出错: {e}")
-
-        except Exception as e:
-            print(f"转写过程中出错: {str(e)}")
-            return None
+                os.unlink(temp_filename)
+            except Exception as e:
+                print(f"删除临时文件时出错: {e}")
         
-    def is_question(self, text):
+    def is_question(self, text: str) -> bool:
         """检测文本是否为问题"""
         # 添加更多的判断条件
         
@@ -420,72 +466,67 @@ class AudioProcessor:
             
         return False
         
-    def get_gpt_response(self, question):
+    def get_gpt_response(self, question: str) -> str:
         """获取GPT回答，使用流式输出"""
-        try:
-            # 先发送正在处理的提示
-            if self.text_callback:
-                self.text_callback("回答: ")
-                self.text_callback("<stream>🤔 正在思考...")
-            
-            # 从GPT_SETTINGS中获取所有可用的参数
-            completion_params = {
-                'model': GPT_SETTINGS['model'],
-                'messages': [
-                    {"role": "system", "content": GPT_SETTINGS['system_prompt']},
-                    {"role": "user", "content": question}
-                ],
-                'stream': True  # 启用流式输出
-            }
-            
-            # 可选参数，如果在设置中存在则添加
-            optional_params = ['temperature', 'max_tokens', 'top_p', 
-                             'frequency_penalty', 'presence_penalty']
-            for param in optional_params:
-                if param in GPT_SETTINGS:
-                    completion_params[param] = GPT_SETTINGS[param]
-            
-            # 用于累积完整的回答
-            full_response = ""
-            
-            # 清除"正在思考"提示
-            if self.text_callback:
-                self.text_callback("<stream>\r" + " " * 20 + "\r")  # 清除当前行
-                time.sleep(0.1)  # 短暂停顿
-            
-            # 使用流式调用API
-            response = self.client.chat.completions.create(**completion_params)
-            
-            # 逐个处理流式响应的内容
-            for chunk in response:
-                # 安全地检查是否有内容，避免索引错误
-                try:
-                    if hasattr(chunk, 'choices') and chunk.choices and hasattr(chunk.choices[0], 'delta'):
-                        delta = chunk.choices[0].delta
-                        if hasattr(delta, 'content') and delta.content:
-                            content = delta.content
-                            full_response += content
-                            # 发送带有特殊标记的增量更新
-                            if self.text_callback:
-                                self.text_callback(f"<stream>{content}")
-                            # 小延迟，避免过快刷新
-                            time.sleep(0.01)
-                except (IndexError, AttributeError) as e:
-                    print(f"处理流式响应块时出错: {e}")
-                    continue  # 跳过这个块，继续处理下一个
-            
-            return full_response
-            
-        except Exception as e:
-            error_message = f"抱歉，获取答案时出现错误: {str(e)}"
-            print(f"GPT API 错误: {e}")
-            
-            if self.text_callback:
-                # 清除现有内容
-                self.text_callback("<stream>\r" + " " * 50 + "\r")  # 清除当前行
-                time.sleep(0.1)  # 短暂停顿
-                
-                # 显示错误消息
-                self.text_callback(f"<stream>❌ {error_message}")
-                
-            return error_message 
+        return ErrorHandler.safe_execute(
+            self._get_gpt_response,
+            "获取GPT回答时出错",
+            self.text_callback,
+            question=question,
+            default_return="抱歉，无法获取回答。"
+        )
+    
+    def _get_gpt_response(self, question: str) -> str:
+        """内部方法：实际GPT调用实现"""
+        # 先发送正在处理的提示
+        if self.text_callback:
+            self.text_callback("回答: ")
+            self.text_callback("<stream>🤔 正在思考...")
+        
+        # 从GPT_SETTINGS中获取所有可用的参数
+        completion_params = {
+            'model': GPT_SETTINGS['model'],
+            'messages': [
+                {"role": "system", "content": GPT_SETTINGS['system_prompt']},
+                {"role": "user", "content": question}
+            ],
+            'stream': True  # 启用流式输出
+        }
+        
+        # 可选参数，如果在设置中存在则添加
+        optional_params = ['temperature', 'max_tokens', 'top_p', 
+                          'frequency_penalty', 'presence_penalty']
+        for param in optional_params:
+            if param in GPT_SETTINGS:
+                completion_params[param] = GPT_SETTINGS[param]
+        
+        # 用于累积完整的回答
+        full_response = ""
+        
+        # 清除"正在思考"提示
+        if self.text_callback:
+            self.text_callback("<stream>\r" + " " * 20 + "\r")  # 清除当前行
+            time.sleep(0.1)  # 短暂停顿
+        
+        # 使用流式调用API
+        response = self.client.chat.completions.create(**completion_params)
+        
+        # 逐个处理流式响应的内容
+        for chunk in response:
+            # 安全地检查是否有内容，避免索引错误
+            try:
+                if hasattr(chunk, 'choices') and chunk.choices and hasattr(chunk.choices[0], 'delta'):
+                    delta = chunk.choices[0].delta
+                    if hasattr(delta, 'content') and delta.content:
+                        content = delta.content
+                        full_response += content
+                        # 发送带有特殊标记的增量更新
+                        if self.text_callback:
+                            self.text_callback(f"<stream>{content}")
+                        # 小延迟，避免过快刷新
+                        time.sleep(0.01)
+            except (IndexError, AttributeError) as e:
+                print(f"处理流式响应块时出错: {e}")
+                continue  # 跳过这个块，继续处理下一个
+        
+        return full_response 

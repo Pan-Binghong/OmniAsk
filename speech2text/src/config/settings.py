@@ -4,10 +4,13 @@
 
 # 音频设置
 AUDIO_SETTINGS = {
-    'sample_rate': 16000,  # 采样率，Whisper推荐16kHz
-    'channels': 1,         # 单声道
-    'chunk_duration': 0.1, # 每个音频块的持续时间（秒）
-    'buffer_duration': 1.0 # 缓冲区持续时间（秒）
+    "SAMPLE_RATE": 16000,    # 采样率
+    "CHANNELS": 1,           # 声道数
+    "CHUNK_DURATION": 0.1,   # 音频块时长（秒）
+    "BUFFER_DURATION": 1.0,  # 缓冲区时长（秒）
+    "SPEECH_TIMEOUT": 2.0,   # 无语音超时时间（秒）
+    "MAX_DURATION": 30.0,    # 最大录音时长（秒），从20秒增加到30秒
+    "PAUSE_TOLERANCE": 2.5,  # 暂停容忍时间（秒），从1.5秒增加到2.5秒
 }
 
 # 界面设置
@@ -88,7 +91,7 @@ WHISPER_SETTINGS = {
 
 # GPT设置
 GPT_SETTINGS = {
-    'model': 'gpt-4o-mini',  # 或其他可用模型
+    'model': 'gpt-4o',  # 或其他可用模型
     'system_prompt': """你是一个专业、友好的AI助手，正在一个实时语音对话系统中工作。
 
     - 保持回答的简洁性、清晰性和信息丰富性
@@ -103,7 +106,7 @@ GPT_SETTINGS = {
     - 如果没有合适的答案，诚实地表明你不知道，而不是编造信息
     """,
     'temperature': 0.3,  # 降低随机性，提高一致性
-    'max_tokens': 600,   # 增加最大token数
+    'max_tokens': 1024,   # 增加最大token数
     'top_p': 0.9,
     'frequency_penalty': 0.6,  # 减少重复
     'presence_penalty': 0.6    # 鼓励多样性

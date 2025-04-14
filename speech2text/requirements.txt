@@ -1,0 +1,19 @@
+# 核心依赖
+numpy>=1.20.0
+openai>=1.0.0
+python-dotenv>=0.19.0
+
+# 音频处理
+sounddevice>=0.4.4
+soundfile>=0.10.3
+
+# UI 依赖
+customtkinter>=5.0.0
+tkinter>=8.6
+
+# 系统监控
+psutil>=5.9.0
+pywin32>=304; platform_system == "Windows"
+
+# 日志和实用工具
+logging>=2.0.0 

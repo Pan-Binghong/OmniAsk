@@ -1,0 +1,1 @@
+"# 字节编译文件\n__pycache__/\n*.py[cod]\n*$py.class\n\n# 测试文件\n*.mp3\n*.wav\n\n# 缓存文件\n.cache/\n\n# 临时文件\ntemp/\ntmp/\n\n# 环境文件（不应包含敏感信息）\n.env\n\n# IDE相关\n.vscode/\n.idea/\n*.swp\n*.swo\n\n# OS相关\n.DS_Store\nThumbs.db" 

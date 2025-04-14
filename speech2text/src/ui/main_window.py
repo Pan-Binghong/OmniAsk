@@ -11,23 +11,97 @@ from ..config.settings import UI_SETTINGS
 import threading
 import queue
 import time
+import re
 
 class MainWindow:
     def __init__(self):
         """初始化主窗口"""
-        self.setup_window()
-        self.setup_styles()
+        # 创建应用程序窗口
+        self.root = ctk.CTk()
+        self.root.title(UI_SETTINGS['window_title'])
+        self.root.geometry(UI_SETTINGS['window_size'])
+        ctk.set_appearance_mode(UI_SETTINGS['theme_mode'])
         
-        # 打字机效果相关变量
-        self.typing_speed = 20  # 打字速度（毫秒）
-        self.typing_queue = queue.Queue()  # 用于存储待显示的文本
-        self.is_typing = False  # 是否正在显示打字效果
+        # 配置行列权重
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
         
-        self.create_widgets()
+        # 创建主框架
+        self.main_frame = ctk.CTkFrame(self.root, fg_color="#121212")
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
         
-        # 启动打字机效果处理线程
+        # 配置主框架行列权重
+        self.main_frame.grid_rowconfigure(0, weight=0)  # 控制区域
+        self.main_frame.grid_rowconfigure(1, weight=1)  # 内容区域
+        self.main_frame.grid_rowconfigure(2, weight=0)  # 状态栏
+        self.main_frame.grid_columnconfigure(0, weight=1)
+        
+        # 创建音频处理器
+        self.audio_processor = AudioProcessor()
+        
+        # 打字机效果相关
+        self.typing_queue = queue.Queue()
+        self.typing_speed = 20  # 每字符毫秒数（越小越快）
+        self.is_typing = False
+        
+        # 创建线程处理打字机效果
         self.typing_thread = threading.Thread(target=self.process_typing_queue, daemon=True)
         self.typing_thread.start()
+        
+        # 创建控制区域
+        self.control_frame = ctk.CTkFrame(self.main_frame, fg_color="#1a1a1a", height=60)
+        self.control_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        self.control_frame.grid_propagate(False)
+        
+        # 创建内容区域
+        self.content_frame = ctk.CTkFrame(self.main_frame, fg_color="#121212")
+        self.content_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        
+        # 配置内容区域行列权重
+        self.content_frame.grid_rowconfigure(0, weight=1)
+        self.content_frame.grid_columnconfigure(0, weight=1)
+        self.content_frame.grid_columnconfigure(1, weight=1)
+        
+        # 创建左右分栏
+        self.left_frame = ctk.CTkFrame(self.content_frame, fg_color="#121212")
+        self.left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        
+        self.right_frame = ctk.CTkFrame(self.content_frame, fg_color="#121212")
+        self.right_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        
+        # 配置左右分栏行列权重
+        self.left_frame.grid_rowconfigure(0, weight=0)  # 音频可视化
+        self.left_frame.grid_rowconfigure(1, weight=0)  # 可视化控制
+        self.left_frame.grid_rowconfigure(2, weight=0)  # 文本标题
+        self.left_frame.grid_rowconfigure(3, weight=1)  # 文本区域
+        self.left_frame.grid_columnconfigure(0, weight=1)
+        
+        self.right_frame.grid_rowconfigure(0, weight=0)  # 标题
+        self.right_frame.grid_rowconfigure(1, weight=1)  # 回答区域
+        self.right_frame.grid_columnconfigure(0, weight=1)
+        
+        # 创建状态栏
+        self.status_frame = ctk.CTkFrame(self.main_frame, fg_color="#1a1a1a", height=30)
+        self.status_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.status_frame.grid_propagate(False)
+        
+        # 状态标签
+        self.status_label = ctk.CTkLabel(
+            self.status_frame,
+            text="✅ 就绪",
+            font=("微软雅黑", 10),
+            text_color="#e2e8f0"
+        )
+        self.status_label.pack(side="left", padx=10)
+        
+        # 创建各个区域的组件
+        self.create_device_selector()
+        self.create_control_buttons()
+        self.create_volume_indicator()
+        self.create_widgets()
+        
+        # 设置自定义样式
+        self.apply_custom_styles()
         
     def setup_window(self):
         """设置窗口基本属性"""
@@ -44,6 +118,19 @@ class MainWindow:
         
     def setup_styles(self):
         """设置自定义样式"""
+        style = ttk.Style()
+        
+        # 设置Combobox样式
+        style.configure(
+            "Custom.TCombobox",
+            background="#2b2b2b",
+            fieldbackground="#2b2b2b",
+            foreground="white",
+            arrowcolor="white"
+        )
+        
+    def apply_custom_styles(self):
+        """应用自定义样式"""
         style = ttk.Style()
         
         # 设置Combobox样式
@@ -190,6 +277,8 @@ class MainWindow:
         self.question_area.tag_configure("error", foreground="#f87171", font=("微软雅黑", 10, "bold"))
         
         self.answer_area.tag_configure("answer", foreground="#a7f3d0", font=("微软雅黑", 11))
+        self.answer_area.tag_configure("answer_bold", foreground="#a7f3d0", font=("微软雅黑", 12, "bold"))
+        self.answer_area.tag_configure("list_item", foreground="#a7f3d0", font=("微软雅黑", 11), lmargin1=20, lmargin2=30)
         self.answer_area.tag_configure("error", foreground="#f87171", font=("微软雅黑", 10, "bold"))
         
         # 显示欢迎消息
@@ -339,7 +428,7 @@ class MainWindow:
                         return
                 
                 # 将流式内容添加到打字队列
-                self.typing_queue.put((content, "answer", True))
+                self.typing_queue.put((content, "answer", True, True))  # 最后参数表示是否需要markdown渲染
                 return
             
             # 根据内容类型将文本添加到相应的区域
@@ -348,28 +437,28 @@ class MainWindow:
                 question_text = text.replace("问题:", "").strip()
                 
                 # 添加分隔线使问题更明显
-                self.typing_queue.put(("\n" + "─"*40 + "\n", "system", False))
+                self.typing_queue.put(("\n" + "─"*40 + "\n", "system", False, False))
                 
                 # 添加带编号的问题
                 formatted_question = f"问题: {question_text}\n"
-                self.typing_queue.put((formatted_question, "question", False))
+                self.typing_queue.put((formatted_question, "question", False, False))
                 
                 # 同时在右侧添加问题提示
-                self.typing_queue.put((f"针对问题: {question_text}\n", "system", True))
+                self.typing_queue.put((f"针对问题: {question_text}\n", "system", True, False))
                 
             elif "文本:" in text:
-                self.typing_queue.put((text + "\n", "transcription", False))
+                self.typing_queue.put((text + "\n", "transcription", False, False))
             elif "回答:" in text:
                 # 只添加"回答:"标记，实际内容通过流式输出显示
-                self.typing_queue.put(("", "answer", True))
+                self.typing_queue.put(("", "answer", True, False))
             elif "错误" in text or "失败" in text:
                 # 错误信息同时显示在两边
-                self.typing_queue.put(("\n❌ " + text + "\n", "error", False))
-                self.typing_queue.put(("\n❌ " + text + "\n", "error", True))
+                self.typing_queue.put(("\n❌ " + text + "\n", "error", False, False))
+                self.typing_queue.put(("\n❌ " + text + "\n", "error", True, False))
                 self.status_label.configure(text="❌ 出现错误", text_color="#f87171")
             else:
                 # 系统消息显示在问题区域
-                self.typing_queue.put((text + "\n", "system", False))
+                self.typing_queue.put((text + "\n", "system", False, False))
             
             # 更新状态标签
             if "开始" in text:
@@ -377,12 +466,26 @@ class MainWindow:
             elif "停止" in text:
                 self.status_label.configure(text="⏹ 已停止", text_color="#f87171")
     
+    def parse_markdown(self, text):
+        """简单的Markdown解析函数"""
+        # 替换粗体 **text** -> 添加bold标签
+        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+        
+        # 替换代码块
+        if '```' in text:
+            text = text.replace('```', '')
+        
+        # 处理列表前的数字和点
+        text = re.sub(r'^\d+\.\s', '', text)
+        
+        return text
+    
     def process_typing_queue(self):
         """处理打字机效果队列"""
         while True:
             try:
                 # 获取下一个要显示的字符和相关信息
-                text, tag, is_stream = self.typing_queue.get()
+                text, tag, is_stream, is_markdown = self.typing_queue.get(timeout=0.1)
                 self.is_typing = True
                 
                 # 选择目标文本区域
@@ -394,16 +497,73 @@ class MainWindow:
                     self.is_typing = False
                     continue
                 
-                # 逐字显示文本
-                for char in text:
-                    if char == '\n':
-                        # 对于换行符，直接添加
-                        target_area.insert("end", char, tag)
-                    else:
-                        # 对于普通字符，添加并模拟打字延迟
+                # 确保样式标签已创建
+                if not hasattr(self, 'markdown_tags_created'):
+                    target_area.tag_configure("bold", font=("微软雅黑", 11, "bold"), foreground="#a7f3d0")
+                    target_area.tag_configure("code", font=("Consolas", 10), background="#2d3748", foreground="#a7f3d0")
+                    target_area.tag_configure("list", lmargin1=20, lmargin2=30, foreground="#a7f3d0")
+                    target_area.tag_configure("answer_bold", font=("微软雅黑", 12, "bold"), foreground="#a7f3d0")
+                    self.markdown_tags_created = True
+                
+                # 检测并处理markdown格式
+                if is_markdown and is_stream:
+                    # 简化处理流程，不再尝试预处理所有markdown格式
+                    # 直接按行逐字符输出，在过程中处理特殊格式
+                    
+                    # 按行处理文本
+                    lines = text.split('\n')
+                    for i, line in enumerate(lines):
+                        # 检查是否是列表项
+                        list_match = re.match(r'^(\d+\.\s)(.*?)$', line)
+                        if list_match:
+                            # 列表项处理为点标记
+                            target_area.insert("end", "• ", "list_item")
+                            # 显示列表内容
+                            content = list_match.group(2)
+                            for char in content:
+                                target_area.insert("end", char, "list_item")
+                                target_area.see("end")
+                                time.sleep(self.typing_speed / 1000)
+                        else:
+                            # 普通文本行，可能包含粗体
+                            # 拆分成普通文本和粗体文本段
+                            parts = []
+                            # 按粗体格式拆分
+                            segments = re.split(r'(\*\*.*?\*\*)', line)
+                            for segment in segments:
+                                bold_match = re.match(r'\*\*(.*?)\*\*', segment)
+                                if bold_match:
+                                    # 粗体文本
+                                    parts.append(("bold", bold_match.group(1)))
+                                else:
+                                    # 普通文本
+                                    if segment:  # 确保不是空字符串
+                                        parts.append(("normal", segment))
+                            
+                            # 显示处理后的各个部分
+                            for part_type, part_text in parts:
+                                if part_type == "bold":
+                                    # 粗体文本
+                                    for char in part_text:
+                                        target_area.insert("end", char, "answer_bold")
+                                        target_area.see("end")
+                                        time.sleep(self.typing_speed / 1000)
+                                else:
+                                    # 普通文本
+                                    for char in part_text:
+                                        target_area.insert("end", char, tag)
+                                        target_area.see("end")
+                                        time.sleep(self.typing_speed / 1000)
+                        
+                        # 除了最后一行外，所有行末尾添加换行符
+                        if i < len(lines) - 1:
+                            target_area.insert("end", "\n", tag)
+                else:
+                    # 非markdown内容，逐字显示文本
+                    for char in text:
                         target_area.insert("end", char, tag)
                         target_area.see("end")
-                        time.sleep(self.typing_speed / 1000)  # 转换为秒
+                        time.sleep(self.typing_speed / 1000)
                 
                 # 确保文本区域滚动到最新内容
                 target_area.see("end")
